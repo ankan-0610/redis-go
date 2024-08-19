@@ -1,0 +1,161 @@
+package main
+
+import (
+	// "context"
+	// "bytes"
+	"flag"
+	"fmt"
+	"reflect"
+
+	// "fmt"
+	"log"
+	"log/slog"
+	"net"
+
+	"github.com/tidwall/resp"
+	// "redis-go/client"
+	// "time"
+)
+
+const defaultListenAddr = ":3001"
+
+type Config struct {
+	ListenAddr string
+}
+
+type Message struct {
+	cmd  Command
+	peer *Peer
+}
+
+type Server struct {
+	Config
+	peers     map[*Peer]bool
+	ln        net.Listener
+	addPeerCh chan *Peer
+	delPeerCh chan *Peer
+	quitCh    chan struct{}
+	msgCh     chan Message
+
+	kv *KV
+}
+
+func NewServer(cfg Config) *Server {
+	if len(cfg.ListenAddr) == 0 {
+		cfg.ListenAddr = defaultListenAddr
+	}
+	return &Server{
+		Config:    cfg,
+		peers:     make(map[*Peer]bool),
+		addPeerCh: make(chan *Peer),
+		delPeerCh: make(chan *Peer),
+		quitCh:    make(chan struct{}),
+		msgCh:     make(chan Message),
+		kv:        NewKV(),
+	}
+}
+
+func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.ListenAddr)
+	if err != nil {
+		return err
+	}
+	s.ln = ln
+
+	slog.Info("server running", "listenAddr", s.ListenAddr)
+
+	go s.loop()
+
+	return s.acceptLoop()
+}
+
+func (s *Server) handleMessage(msg Message) error {
+	slog.Info("go message from client","type",reflect.TypeOf(msg.cmd))
+	switch v := msg.cmd.(type) {
+	case ClientCommand:
+		err := resp.NewWriter(msg.peer.conn).WriteString("OK\r\n")
+		if err!= nil{
+			return err
+		}
+	case SetCommand:
+		if err:=s.kv.Set(v.key, v.val);err!=nil{
+			return err
+		}
+		if err := resp.NewWriter(msg.peer.conn).WriteString("OK\r\n"); err != nil {
+			return fmt.Errorf("peer send error: %s", err)
+		}
+	case GetCommand:
+		val, ok := s.kv.Get(v.key)
+		if !ok {
+			return fmt.Errorf("key not found")
+		}
+		if err := resp.NewWriter(msg.peer.conn).WriteString(string(val)); err != nil {
+			return fmt.Errorf("peer send error: %s", err)
+		}
+	case HelloCommand:
+		fmt.Println("Hello handled in the server")
+		spec := map[string]string{
+			"server": "redis",
+			"version":   "6.0.0",
+			"proto":"3",
+			"mode":"standalone",
+			"role":"master",
+		}
+		_,err:=msg.peer.Send(respWriteMap(spec))
+		if err!=nil{
+			return fmt.Errorf("peer send error: %s", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) loop() {
+	for {
+		select {
+		case rawMsg := <-s.msgCh:
+			if err := s.handleMessage(rawMsg); err != nil {
+				slog.Error("raw message error", "err", err)
+			}
+		case <-s.quitCh:
+			return
+		case peer := <-s.addPeerCh:
+			slog.Info("peer connected", "remoteAddr", peer.conn.RemoteAddr())
+			s.peers[peer] = true
+		case peer := <-s.delPeerCh:
+			slog.Info("peer disconnected", "remoteAddr", peer.conn.RemoteAddr())
+			delete(s.peers, peer)
+		}
+	}
+}
+
+func (s *Server) acceptLoop() error {
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			slog.Error("accept error", "err", err)
+			continue
+		}
+		go s.handleConn(conn)
+	}
+}
+
+func (s *Server) handleConn(conn net.Conn) {
+	peer := NewPeer(conn, s.msgCh, s.delPeerCh)
+	s.addPeerCh <- peer
+	// slog.Info("new peer connected","remoteAddr",conn.RemoteAddr())
+	if err := peer.readLoop(); err != nil {
+		slog.Error("peer read error", "err", err, "remoteAddr", conn.RemoteAddr())
+	}
+}
+
+func main() {
+	listenAddr := flag.String("listenAddr", defaultListenAddr, "listen address of the redis-go server")
+	flag.Parse()
+
+	server := NewServer(Config{
+		ListenAddr: *listenAddr,
+	})
+	log.Fatal(server.Start())
+	// fmt.Println(server.kv.data)
+}
